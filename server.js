@@ -1,6 +1,8 @@
 const http = require("http");
 const { readFile, writeFile, mkdir } = require("fs/promises");
 const path = require("path");
+const rules = require("./rules");
+const occupancy = require("./occupancy");
 
 const PORT = Number(process.env.PORT || 3020);
 const DB_FILE = path.join(__dirname, "data", "db.json");
@@ -24,10 +26,12 @@ const initialData = {
       type: "虫蛀孔",
       beforePhotoUrl: "https://example.local/before-014-1.jpg",
       afterPhotoUrl: "",
-      status: "pending",
+      status: "verification_pending",
       repairNote: "",
       batchId: null,
-      createdAt: new Date().toISOString(),
+      curing: null,
+      needsEnvVerification: true,
+      createdAt: "2026-06-16T00:00:00.000Z",
       repairedAt: null
     },
     {
@@ -37,14 +41,17 @@ const initialData = {
       type: "撕裂",
       beforePhotoUrl: "https://example.local/before-014-2.jpg",
       afterPhotoUrl: "",
-      status: "pending",
+      status: "verification_pending",
       repairNote: "",
       batchId: null,
-      createdAt: new Date().toISOString(),
+      curing: null,
+      needsEnvVerification: true,
+      createdAt: "2026-06-16T00:00:00.000Z",
       repairedAt: null
     }
   ],
-  batches: []
+  batches: [],
+  curingBookings: []
 };
 
 const routes = [
@@ -55,9 +62,12 @@ const routes = [
   "POST /rubbings/:id/damages",
   "GET /damages?status=&type=",
   "PATCH /damages/:id",
+  "POST /damages/:id/start",
   "GET /batches",
   "POST /batches",
   "GET /batches/:id",
+  "POST /batches/:id/start",
+  "POST /batches/:id/cancel",
   "POST /batches/:id/complete"
 ];
 
@@ -72,7 +82,12 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  // 旧缺损缺环境值：迁移为待核验，并写回现有数据文件
+  if (occupancy.migrateCuring(db)) {
+    await writeFile(DB_FILE, JSON.stringify(db, null, 2));
+  }
+  return db;
 }
 
 async function writeDb(data) {
@@ -91,8 +106,7 @@ async function parseBody(req) {
   try {
     return JSON.parse(raw);
   } catch {
-    const error = new Error("请求体必须是合法JSON");
-    error.status = 400;
+    const error = new rules.BadRequestError("请求体必须是合法JSON");
     throw error;
   }
 }
@@ -104,9 +118,7 @@ function makeId(prefix) {
 function required(body, fields) {
   const missing = fields.filter((field) => body[field] === undefined || body[field] === "");
   if (missing.length) {
-    const error = new Error(`缺少字段：${missing.join(", ")}`);
-    error.status = 400;
-    throw error;
+    throw new rules.BadRequestError(`缺少字段：${missing.join(", ")}`);
   }
 }
 
@@ -126,9 +138,33 @@ function enrichBatch(db, batch) {
     ...batch,
     damages,
     total: damages.length,
-    repaired: damages.filter((item) => item.status === "repaired").length,
-    pending: damages.filter((item) => item.status !== "repaired").length
+    scheduled: damages.filter((item) => item.status === "scheduled").length,
+    inRepair: damages.filter((item) => item.status === "in_repair").length,
+    reviewPending: damages.filter((item) => item.status === "review_pending").length,
+    repaired: damages.filter((item) => item.status === "repaired").length
   };
+}
+
+const SCHEDULE_FIELDS = ["slotId", "startAt", "endAt", "temperatureC", "humidityPct"];
+
+function schedulePatchFromBody(body, base) {
+  return {
+    slotId: body.slotId ?? base?.slotId,
+    startAt: body.startAt ?? base?.startAt,
+    endAt: body.endAt ?? base?.endAt,
+    temperatureC: body.temperatureC ?? base?.temperatureC,
+    humidityPct: body.humidityPct ?? base?.humidityPct
+  };
+}
+
+// 校验单项改约；排除其自身旧占用，避免与自己冲突
+function validateReschedule(db, damage, patch) {
+  const [item] = rules.validateBatchSchedule(
+    [{ damageId: damage.id, ...patch }],
+    db,
+    { excludeDamageIds: [damage.id] }
+  );
+  return item;
 }
 
 async function handle(req, res) {
@@ -137,7 +173,16 @@ async function handle(req, res) {
   const db = await readDb();
 
   if (req.method === "GET" && pathname === "/health") {
-    return send(res, 200, { ok: true, service: "rubbing-repair-api", routes });
+    return send(res, 200, {
+      ok: true,
+      service: "rubbing-repair-api",
+      routes,
+      environment: {
+        temperatureRange: [rules.TEMP_MIN, rules.TEMP_MAX],
+        humidityRange: [rules.HUMIDITY_MIN, rules.HUMIDITY_MAX],
+        maxDamagesPerRubbingPerDay: rules.MAX_DAMAGES_PER_RUBBING_PER_DAY
+      }
+    });
   }
 
   if (req.method === "GET" && pathname === "/rubbings") {
@@ -190,6 +235,8 @@ async function handle(req, res) {
       status: "pending",
       repairNote: "",
       batchId: null,
+      curing: null,
+      needsEnvVerification: false,
       createdAt: new Date().toISOString(),
       repairedAt: null
     };
@@ -205,20 +252,75 @@ async function handle(req, res) {
     return send(res, 200, { data });
   }
 
+  const damageStartMatch = pathname.match(/^\/damages\/([^/]+)\/start$/);
+  if (damageStartMatch && req.method === "POST") {
+    const damage = db.damages.find((item) => item.id === damageStartMatch[1]);
+    if (!damage) return send(res, 404, { error: "缺损项不存在" });
+    occupancy.markStarted(db, damage.id);
+    await writeDb(db);
+    return send(res, 200, { data: damage });
+  }
+
   const damagePatchMatch = pathname.match(/^\/damages\/([^/]+)$/);
   if (damagePatchMatch && req.method === "PATCH") {
     const damage = db.damages.find((item) => item.id === damagePatchMatch[1]);
     if (!damage) return send(res, 404, { error: "缺损项不存在" });
     const body = await parseBody(req);
+
+    const hasSchedulePatch = SCHEDULE_FIELDS.some((field) => body[field] !== undefined);
+    if (hasSchedulePatch && body.status === "in_repair") {
+      throw new rules.BadRequestError("开工与改动预约不能在同一请求中提交");
+    }
+
     Object.assign(damage, {
       position: body.position ?? damage.position,
       type: body.type ?? damage.type,
       beforePhotoUrl: body.beforePhotoUrl ?? damage.beforePhotoUrl,
       afterPhotoUrl: body.afterPhotoUrl ?? damage.afterPhotoUrl,
-      status: body.status ?? damage.status,
       repairNote: body.repairNote ?? damage.repairNote
     });
-    damage.repairedAt = damage.status === "repaired" ? new Date().toISOString() : damage.repairedAt;
+
+    // 直接的状态变更只允许开工；其余生命周期走专门入口
+    if (body.status !== undefined) {
+      if (body.status === "in_repair") {
+        occupancy.markStarted(db, damage.id);
+      } else if (body.status === "repaired") {
+        throw new rules.BadRequestError("结项请使用 POST /batches/:id/complete");
+      } else {
+        throw new rules.BadRequestError("不支持直接写入该状态，请走排程/开工/取消入口");
+      }
+    }
+
+    if (hasSchedulePatch) {
+      const patch = schedulePatchFromBody(body, damage.curing);
+      if (damage.status === "in_repair") {
+        // 开工后改动预约或环境值：该项回待复核并释放养护位（新值待复核，不占用）
+        const item = rules.normalizeScheduleItem({ damageId: damage.id, ...patch });
+        occupancy.releaseBooking(
+          db,
+          damage.id,
+          "post_start_change",
+          {
+            slotId: item.slotId,
+            startAt: item.startAt.toISOString(),
+            endAt: item.endAt.toISOString(),
+            temperatureC: item.temperatureC,
+            humidityPct: item.humidityPct,
+            reviewNote: "开工后改动预约或环境值，待复核"
+          }
+        );
+        damage.status = "review_pending";
+      } else if (damage.status === "scheduled" || damage.status === "review_pending") {
+        // 改约：整项重新过判定（环境、位交叉、当天限额），通过后换占新预约
+        const item = validateReschedule(db, damage, patch);
+        occupancy.rebindBooking(db, damage.id, item);
+      } else if (damage.status === "verification_pending") {
+        throw new rules.BadRequestError("该项环境值待核验，需在建批时登记养护位、起止时刻与温湿度");
+      } else {
+        throw new rules.BadRequestError("当前状态不可改动养护预约，请先建批排程");
+      }
+    }
+
     await writeDb(db);
     return send(res, 200, { data: damage });
   }
@@ -229,26 +331,43 @@ async function handle(req, res) {
 
   if (req.method === "POST" && pathname === "/batches") {
     const body = await parseBody(req);
-    required(body, ["name", "damageIds"]);
-    if (!Array.isArray(body.damageIds) || body.damageIds.length === 0) return send(res, 400, { error: "damageIds必须是非空数组" });
-    const invalid = body.damageIds.filter((id) => !db.damages.find((damage) => damage.id === id));
-    if (invalid.length) return send(res, 400, { error: `缺损项不存在：${invalid.join(", ")}` });
+    required(body, ["name", "items"]);
+    if (!Array.isArray(body.items) || body.items.length === 0) {
+      return send(res, 400, { error: "items必须是非空数组，每项含养护位、起止时刻、温湿度" });
+    }
+
+    // 判定：同一位时段交叉 / 同一拓片当天超过两块 / 环境值越界，任一命中整批拒绝
+    const items = rules.validateBatchSchedule(body.items, db);
+
+    // 占用状态预检（validateBatchSchedule 已保证缺损存在）
+    const alreadyHeld = items
+      .map((item) => item.damageId)
+      .filter((damageId) => occupancy.findHeldBookingByDamage(db, damageId));
+    if (alreadyHeld.length) {
+      return send(res, 409, {
+        error: "以下缺损已有占用中的养护预约",
+        conflicts: alreadyHeld.map((damageId) => ({ type: "already_held", damageId }))
+      });
+    }
+    const finished = items
+      .map((item) => db.damages.find((damage) => damage.id === item.damageId))
+      .filter((damage) => damage.status === "repaired");
+    if (finished.length) {
+      return send(res, 400, { error: `已结项缺损不可再排程：${finished.map((d) => d.id).join(", ")}` });
+    }
+
     const batch = {
       id: makeId("batch"),
       name: body.name,
       status: "open",
-      damageIds: body.damageIds,
+      damageIds: items.map((item) => item.damageId),
       note: body.note || "",
       createdAt: new Date().toISOString(),
-      completedAt: null
+      completedAt: null,
+      canceledAt: null
     };
     db.batches.push(batch);
-    db.damages.forEach((damage) => {
-      if (body.damageIds.includes(damage.id)) {
-        damage.batchId = batch.id;
-        damage.status = "in_repair";
-      }
-    });
+    occupancy.reserveBookings(db, items, batch.id);
     await writeDb(db);
     return send(res, 201, { data: enrichBatch(db, batch) });
   }
@@ -260,23 +379,82 @@ async function handle(req, res) {
     return send(res, 200, { data: enrichBatch(db, batch) });
   }
 
+  const batchStartMatch = pathname.match(/^\/batches\/([^/]+)\/start$/);
+  if (batchStartMatch && req.method === "POST") {
+    const batch = db.batches.find((item) => item.id === batchStartMatch[1]);
+    if (!batch) return send(res, 404, { error: "修补批次不存在" });
+    if (batch.status === "completed") return send(res, 409, { error: "批次已结项" });
+    if (batch.status === "canceled") return send(res, 409, { error: "批次已取消" });
+    const members = db.damages.filter((damage) => batch.damageIds.includes(damage.id));
+    const blocked = members.filter((damage) => !["scheduled", "in_repair"].includes(damage.status));
+    if (blocked.length) {
+      return send(res, 409, {
+        error: "存在待复核或缺位的缺损项，不能整批开工",
+        conflicts: blocked.map((damage) => ({ damageId: damage.id, status: damage.status }))
+      });
+    }
+    const started = [];
+    for (const damage of members) {
+      if (damage.status === "scheduled") {
+        occupancy.markStarted(db, damage.id);
+        started.push(damage.id);
+      }
+    }
+    await writeDb(db);
+    return send(res, 200, { data: enrichBatch(db, batch), started });
+  }
+
+  const cancelMatch = pathname.match(/^\/batches\/([^/]+)\/cancel$/);
+  if (cancelMatch && req.method === "POST") {
+    const batch = db.batches.find((item) => item.id === cancelMatch[1]);
+    if (!batch) return send(res, 404, { error: "修补批次不存在" });
+    if (batch.status === "completed") return send(res, 409, { error: "批次已结项，不可取消" });
+    if (batch.status === "canceled") return send(res, 409, { error: "批次已取消" });
+
+    // 只释放未开工项；已开工的继续占用养护位
+    const released = occupancy.cancelUnstarted(db, batch.id);
+    batch.damageIds = batch.damageIds.filter((damageId) => !released.includes(damageId));
+    batch.canceledAt = new Date().toISOString();
+    if (batch.damageIds.length === 0) {
+      batch.status = "canceled";
+    }
+    await writeDb(db);
+    return send(res, 200, {
+      data: enrichBatch(db, batch),
+      released,
+      stillActive: batch.damageIds
+    });
+  }
+
   const completeMatch = pathname.match(/^\/batches\/([^/]+)\/complete$/);
   if (completeMatch && req.method === "POST") {
     const batch = db.batches.find((item) => item.id === completeMatch[1]);
     if (!batch) return send(res, 404, { error: "修补批次不存在" });
+    if (batch.status === "completed") return send(res, 409, { error: "批次已结项" });
+
+    const members = db.damages.filter((damage) => batch.damageIds.includes(damage.id));
+    const notInRepair = members.filter((damage) => damage.status !== "in_repair");
+    if (notInRepair.length) {
+      return send(res, 409, {
+        error: "存在未开工或待复核的缺损项，不能结项",
+        conflicts: notInRepair.map((damage) => ({ damageId: damage.id, status: damage.status }))
+      });
+    }
+
     const body = await parseBody(req);
     const results = Array.isArray(body.results) ? body.results : [];
-    batch.status = "completed";
-    batch.completedAt = new Date().toISOString();
-    batch.note = body.note ?? batch.note;
-    db.damages.forEach((damage) => {
-      if (!batch.damageIds.includes(damage.id)) return;
+    members.forEach((damage) => {
       const result = results.find((item) => item.damageId === damage.id) || {};
       damage.status = "repaired";
       damage.afterPhotoUrl = result.afterPhotoUrl || body.defaultAfterPhotoUrl || damage.afterPhotoUrl;
       damage.repairNote = result.repairNote || body.defaultRepairNote || damage.repairNote;
       damage.repairedAt = new Date().toISOString();
     });
+    // 结项留档：占用账页转 archived，不释放
+    occupancy.archiveBatch(db, batch.id);
+    batch.status = "completed";
+    batch.completedAt = new Date().toISOString();
+    batch.note = body.note ?? batch.note;
     await writeDb(db);
     return send(res, 200, { data: enrichBatch(db, batch) });
   }
@@ -285,9 +463,13 @@ async function handle(req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  handle(req, res).catch((error) => {
+    const body = { error: error.message || "服务器错误" };
+    if (error.conflicts) body.conflicts = error.conflicts;
+    send(res, error.status || 500, body);
+  });
 });
 
 server.listen(PORT, () => {
-  console.log(`Rubbing repair API running at http://127.0.0.1:${PORT}`);
+  console.log("Rubbing repair API running at http://127.0.0.1:" + PORT);
 });

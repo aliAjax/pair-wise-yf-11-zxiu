@@ -17,9 +17,11 @@
       "type": "虫蛀孔",
       "beforePhotoUrl": "https://example.local/before-014-1.jpg",
       "afterPhotoUrl": "",
-      "status": "pending",
+      "status": "verification_pending",
       "repairNote": "",
       "batchId": null,
+      "curing": null,
+      "needsEnvVerification": true,
       "createdAt": "2026-06-16T00:00:00.000Z",
       "repairedAt": null
     },
@@ -30,12 +32,15 @@
       "type": "撕裂",
       "beforePhotoUrl": "https://example.local/before-014-2.jpg",
       "afterPhotoUrl": "",
-      "status": "pending",
+      "status": "verification_pending",
       "repairNote": "",
       "batchId": null,
+      "curing": null,
+      "needsEnvVerification": true,
       "createdAt": "2026-06-16T00:00:00.000Z",
       "repairedAt": null
     }
   ],
-  "batches": []
+  "batches": [],
+  "curingBookings": []
 }
